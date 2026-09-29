@@ -1,0 +1,78 @@
+"""Run with:  python -m unittest discover tests"""
+import unittest
+
+from tracker import Database, FundraisingService
+from tracker.models import (CanningDonation, DonationFactory, Member, OnlineDonation,
+                            Organization, ValidationError)
+
+
+class ModelTests(unittest.TestCase):
+    def test_invalid_access_id_rejected(self):
+        with self.assertRaises(ValidationError):
+            Member(1, "Nittany", "Lion", "not-an-id")
+
+    def test_org_goal_must_be_positive(self):
+        with self.assertRaises(ValidationError):
+            Organization("Test Org", "General", 0)
+
+    def test_canning_requires_location(self):
+        with self.assertRaises(ValidationError):
+            CanningDonation(member_id=1, amount=50)
+
+    def test_polymorphic_net_amount(self):
+        online = OnlineDonation(member_id=1, amount=100)
+        canning = CanningDonation(member_id=1, amount=100, location="Erie")
+        self.assertLess(online.net_amount(), 100)      # processing fee applied
+        self.assertEqual(canning.net_amount(), 100)    # no fee
+
+    def test_factory_builds_correct_subclass(self):
+        d = DonationFactory.create("Canning", member_id=1, amount=20, location="Erie")
+        self.assertIsInstance(d, CanningDonation)
+        with self.assertRaises(ValidationError):
+            DonationFactory.create("Bitcoin", member_id=1, amount=20)
+
+
+class ServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.db = Database(":memory:")
+        self.s = FundraisingService(self.db)
+        self.org = self.s.create_organization("CS Club", "Special Interest", 1000)
+        self.m1 = self.s.add_member(self.org.id, "Ava", "Smith", "avs123", "Chair", 300)
+        self.m2 = self.s.add_member(self.org.id, "Liam", "Lee", "lzl45")
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_totals_and_progress(self):
+        self.s.record_donation(self.m1.id, "Online", 200, "Grandma")
+        self.s.record_donation(self.m2.id, "Canning", 300, location="Pittsburgh")
+        p = self.s.org_progress(self.org.id)
+        self.assertEqual(p.raised, 500)
+        self.assertAlmostEqual(p.percent, 50.0)
+        self.assertEqual(p.remaining, 500)
+
+    def test_milestones_reported_once(self):
+        _, crossed = self.s.record_donation(self.m1.id, "Cash", 600)
+        self.assertEqual(crossed, [25, 50])
+        _, crossed = self.s.record_donation(self.m1.id, "Cash", 10)
+        self.assertEqual(crossed, [])
+
+    def test_leaderboard_order(self):
+        self.s.record_donation(self.m2.id, "Cash", 50)
+        self.s.record_donation(self.m1.id, "Cash", 75)
+        top = self.s.top_fundraisers()
+        self.assertEqual(top[0].name, "Ava Smith")
+
+    def test_duplicate_access_id_rejected(self):
+        with self.assertRaises(ValidationError):
+            self.s.add_member(self.org.id, "Other", "Person", "avs123")
+
+    def test_deleting_org_cascades(self):
+        self.s.record_donation(self.m1.id, "Cash", 20)
+        self.s.orgs.delete(self.org.id)
+        self.assertEqual(self.s.members.count(), 0)
+        self.assertEqual(self.s.donations.count(), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
